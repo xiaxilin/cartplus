@@ -65,8 +65,23 @@ class ModelConfig:
                                    # exp(-g w / Pbar) underflows in float32 in arid catchments under large storms and P_n / F_c then
                                    # gives a NaN gradient; the CAMELS-AUS runs of CaRT+ used 1e-4 (DATASET_DEFAULTS), GB / US none
     ablate: str = "none"           # none | no_gw | no_quick | no_uh | no_exch | single: CaRT with one component removed (no preset)
+    dt: float = 1.0                # step length in days (1 = daily, 1/24 = hourly). Every parameter keeps its daily unit; the step length
+                                   # enters the discrete operators only. Uniform-input scheme: the input of every step arrives at a constant
+                                   # rate within the step and every store integrates its own equation over the step (kernels/exact.py), so a
+                                   # daily and an hourly run approximate the same continuous model. dt = 1 is therefore not the daily model of
+                                   # the paper (main branch), whose input arrives at the start of the step, and the networks of the main branch
+                                   # are not meant for this scheme: train with it (cart.train) and run the trained network at any step.
+    nsub: int = 4                  # symmetric (Strang) sub-steps of the quick store per step, combined with nsub / 2 sub-steps by Richardson
+                                   # extrapolation (fourth order); its relaxation rate times the daily step reaches 0.3 to 0.7 in the median
+                                   # catchment and 1.8 to 3.7 at the 95th percentile
+    nsub_slow: int = 1             # symmetric sub-steps of the slow stores with no closed form (groundwater uptake, and the production and
+                                   # depression stores with prod_lie = False); relaxation rate times the daily step about 0.01 to 0.1
+    prod_lie: bool = True          # production and depression stores: wetting / drying solved exactly in the net input of the step, then the
+                                   # percolation in sequence (first order); False = the symmetric splitting of kernels/exact.prod_x / pareto_x
+                                   # with nsub_slow sub-steps (the daily flow differs by a median NSE of 1e-5)
 
     def __post_init__(self):
+        assert self.dt > 0.0, self.dt
         assert self.ablate in ("none", "no_gw", "no_quick", "no_uh", "no_exch", "single"), self.ablate
         if self.route_conn:
             assert self.fast_law_der

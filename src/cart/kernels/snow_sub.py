@@ -1,6 +1,6 @@
 """Five-band degree-day snowpack with sublimation to the atmosphere (a boundary flux N_k -> atmosphere), fused Triton recursion with
-stored-state adjoint (adjoint.backward_k). Per band and day, after snowfall and before melt: sublimation u_k = min(ks E, N_k), E the
-demand (PET); ks = 0 gives the plain degree-day band snowpack.
+stored-state adjoint (adjoint.backward_k). Per band and step, snowfall, sublimation at the rate ks E (E the demand, PET) and melt act at constant rates within the
+step; when the pack disappears within the step, sublimation and melt share it in proportion to their rates; ks = 0 gives the plain degree-day band snowpack.
 Outputs: liquid input (rain + melt) and area-weighted sublimation; states N_k."""
 import numpy as np
 import torch
@@ -31,10 +31,12 @@ def _bsub_fwd(p_ptr, t_ptr, e_ptr, dT_ptr, a_ptr, tt_ptr, cf_ptr, sf_ptr, ks_ptr
             tk = ta + dT
             cold = tk < tt
             s = s + tl.where(cold, sf * p, 0.0)
-            u = tl.minimum(ks * e, s)
-            s = s - u
-            mlt = tl.minimum(tl.maximum(cf * (tk - tt), 0.0), s)
-            s = s - mlt
+            uu = ks * e
+            mm = tl.maximum(cf * (tk - tt), 0.0)
+            fr = tl.where(uu + mm > s, s / tl.maximum(uu + mm, 1e-30), 1.0)             # constant rates until the pack is gone
+            u = uu * fr
+            mlt = mm * fr
+            s = tl.maximum(s - u - mlt, 0.0)
             liq += a * (tl.where(cold, 0.0, p) + mlt)
             sub += a * u
             tl.store(X_ptr + (n * T + t) * K + k, s, mask=m)
@@ -48,8 +50,10 @@ def bsub_step(xp, p, ta, e, *prm):
     for k in range(K):
         tk = ta + dT[k]; cold = tk < tt
         s = xp[k] + torch.where(cold, sf * p, torch.zeros_like(p))
-        u = torch.minimum(ks * e, s); s = s - u
-        mlt = torch.minimum(torch.clamp(cf * (tk - tt), min=0.0), s); s = s - mlt
+        uu, mm = ks * e, torch.clamp(cf * (tk - tt), min=0.0)
+        fr = torch.where(uu + mm > s, s / (uu + mm).clamp(min=1e-30), torch.ones_like(s))
+        u, mlt = uu * fr, mm * fr
+        s = torch.relu(s - u - mlt)
         liq = liq + a[k] * (torch.where(cold, torch.zeros_like(p), p) + mlt); sub = sub + a[k] * u
         xs.append(s)
     return xs, [liq, sub]

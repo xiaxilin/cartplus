@@ -37,10 +37,12 @@ def _bra_fwd(p_ptr, t_ptr, e_ptr, r_ptr, dT_ptr, a_ptr, fk_ptr, tt_ptr, cf_ptr, 
             cold = tk < tt
             pk = fk * p
             s = s + tl.where(cold, sf * pk, 0.0)
-            u = tl.minimum(ks * e, s)
-            s = s - u
-            mlt = tl.minimum(tl.where(cold, 0.0, cf * (tk - tt) + rf * r), s)
-            s = s - mlt
+            uu = ks * e
+            mm = tl.where(cold, 0.0, cf * (tk - tt) + rf * r)
+            fr = tl.where(uu + mm > s, s / tl.maximum(uu + mm, 1e-30), 1.0)             # constant rates until the pack is gone
+            u = uu * fr
+            mlt = mm * fr
+            s = tl.maximum(s - u - mlt, 0.0)
             liq += a * (tl.where(cold, 0.0, pk) + mlt)
             sub += a * u
             tl.store(X_ptr + (n * T + t) * K + k, s, mask=m)
@@ -54,8 +56,10 @@ def bra_step(xp, p, ta, e, r, *prm):
     for k in range(K):
         tk = ta + dT[k]; cold = tk < tt; pk = fk[k] * p
         s = xp[k] + torch.where(cold, sf * pk, torch.zeros_like(p))
-        u = torch.minimum(ks * e, s); s = s - u
-        mlt = torch.minimum(torch.where(cold, torch.zeros_like(p), cf * (tk - tt) + rf * r), s); s = s - mlt
+        uu, mm = ks * e, torch.where(cold, torch.zeros_like(p), cf * (tk - tt) + rf * r)
+        fr = torch.where(uu + mm > s, s / (uu + mm).clamp(min=1e-30), torch.ones_like(s))
+        u, mlt = uu * fr, mm * fr
+        s = torch.relu(s - u - mlt)
         liq = liq + a[k] * (torch.where(cold, torch.zeros_like(p), pk) + mlt); sub = sub + a[k] * u
         xs.append(s)
     return xs, [liq, sub]

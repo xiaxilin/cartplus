@@ -14,6 +14,8 @@ One day is integrated EXACTLY (input and drainage jointly), in a cancellation-fr
 Outputs per day: d_z, q_z (mm/d per unit zone area); the caller weights them by the zone fraction w.
 """
 
+import functools
+
 import numpy as np
 import torch
 import triton
@@ -45,11 +47,11 @@ def _phi(x):
 
 
 @triton.jit
-def _zone_fwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, dz_ptr, qz_ptr, N, T, BLOCK: tl.constexpr):
+def _zone_fwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, dz_ptr, qz_ptr, N, T, DT, BLOCK: tl.constexpr):
     n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = n < N
     cz = tl.load(cz_ptr + n, mask=m, other=1.0)
-    b = 1.0 / tl.load(tz_ptr + n, mask=m, other=1.0)
+    b = DT / tl.load(tz_ptr + n, mask=m, other=1.0)                                     # drainage over a step of DT days
     Z = tl.load(x0_ptr + n, mask=m, other=0.0)
     for t in range(T):
         p = tl.load(p_ptr + n * T + t, mask=m, other=0.0)
@@ -102,10 +104,10 @@ def _t_phi(x):
     return torch.where(small, 1.0 + 0.5 * x + x * x / 3.0, -torch.log(1.0 - xs) / xs)
 
 
-def zone_step(xp, p, ev, cz, tz):
-    """the kernel's one-day step, elementwise torch (for adjoint.backward_k and as a float64 reference)"""
+def zone_step(xp, p, ev, cz, tz, dt=1.0):
+    """the kernel's one-step update, elementwise torch (for adjoint.backward_k and as a float64 reference)"""
     (Z,) = xp
-    b = 1.0 / tz
+    b = dt / tz
     pn = torch.clamp(p - ev, min=0.0)
     en = torch.clamp(ev - p, min=0.0)
     z0 = Z / cz
@@ -135,25 +137,27 @@ def zone_step(xp, p, ev, cz, tz):
 
 class ZoneStore(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, p, ev, x0, cz, tz):
+    def forward(ctx, p, ev, x0, cz, tz, dt=1.0):
         N, T = p.shape
         a = [v.detach().float().contiguous() for v in (p, ev, cz, tz, x0)]
         X = torch.empty(N, T, device=p.device); dz = torch.empty(N, T, device=p.device); qz = torch.empty(N, T, device=p.device)
-        _zone_fwd[(triton.cdiv(N, BLOCK),)](*a, X, dz, qz, N, T, BLOCK=BLOCK)
+        _zone_fwd[(triton.cdiv(N, BLOCK),)](*a, X, dz, qz, N, T, float(dt), BLOCK=BLOCK)
+        ctx.dt = float(dt)
         ctx.save_for_backward(a[0], a[1], a[4], X, a[2], a[3])
         return dz, qz, X
 
     @staticmethod
     def backward(ctx, gdz, gqz, gX):
         p, ev, x0, X, cz, tz = ctx.saved_tensors
-        gi, gp = backward_k(zone_step, X[..., None], x0[:, None], gX[..., None] if gX is not None else None, [gdz, gqz], [p, ev], [cz, tz])
-        return (gi[0], gi[1], None, *gp)
+        step = functools.partial(zone_step, dt=ctx.dt)
+        gi, gp = backward_k(step, X[..., None], x0[:, None], gX[..., None] if gX is not None else None, [gdz, gqz], [p, ev], [cz, tz])
+        return (gi[0], gi[1], None, *gp, None)
 
 
-def zone(p, ev, cz, tz, x0=None):
-    """p, ev [N, T] precipitation and PET (mm/d); cz, tz [N] -> d_z, q_z [N, T] (mm/d per unit zone area), Z [N, T]"""
+def zone(p, ev, cz, tz, x0=None, dt=1.0):
+    """p, ev [N, T] precipitation and PET (mm per step); cz [N], tz [N] (days), dt step (days) -> d_z, q_z [N, T] per step, Z [N, T]"""
     x0 = 0.3 * cz.detach() if x0 is None else x0
-    return ZoneStore.apply(p, ev, x0, cz, tz)
+    return ZoneStore.apply(p, ev, x0, cz, tz, dt)
 
 
 def zone_np(P, E, cz, tz, z0frac=0.3):

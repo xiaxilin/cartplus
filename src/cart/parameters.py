@@ -35,7 +35,7 @@ def static_table(cfg: ModelConfig, full: bool = False) -> "OrderedDict[str, tupl
     no effect (see the module docstring)."""
     S = OrderedDict([
         ("lC", (np.log(25.0), np.log(1600.0), np.log(225.0))),        # production-store capacity C (mm)
-        ("X4", (0.5, 6.0, 1.26)),                                      # unit-hydrograph time base (d)
+        ("X4", (1.0 / 24.0, 6.0, 1.26)),                               # unit-hydrograph time base (d), down to one hour
         ("lX3", (np.log(5.0), np.log(1000.0), np.log(33.0))),          # routing-store capacity X3 (mm)
         ("ltau", (np.log(3.0), np.log(1460.0), np.log(78.0))),         # groundwater residence time tau (d)
         ("X2", (-20.0, 10.0, -0.35)),                                  # exchange coefficient X2 (mm/d); [-20, 0] with exch_loss / exch_diss

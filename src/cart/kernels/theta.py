@@ -46,11 +46,11 @@ def _day(Z0, p, ev, cz, b):
 
 
 @triton.jit
-def _theta_fwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, N, T, BLOCK: tl.constexpr):
+def _theta_fwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, N, T, DT, BLOCK: tl.constexpr):
     n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = n < N
     cz = tl.load(cz_ptr + n, mask=m, other=1.0)
-    b = 1.0 / tl.load(tz_ptr + n, mask=m, other=1.0)
+    b = DT / tl.load(tz_ptr + n, mask=m, other=1.0)
     Z = tl.load(x0_ptr + n, mask=m, other=0.0)
     for t in range(T):
         p = tl.load(p_ptr + n * T + t, mask=m, other=0.0)
@@ -60,12 +60,12 @@ def _theta_fwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, N, T, BLOCK: tl.cons
 
 
 @triton.jit
-def _theta_bwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, gX_ptr, gp_ptr, ge_ptr, gcz_ptr, gtz_ptr, N, T, BLOCK: tl.constexpr):
+def _theta_bwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, gX_ptr, gp_ptr, ge_ptr, gcz_ptr, gtz_ptr, N, T, DT, BLOCK: tl.constexpr):
     n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = n < N
     cz = tl.load(cz_ptr + n, mask=m, other=1.0)
     tz = tl.load(tz_ptr + n, mask=m, other=1.0)
-    b = 1.0 / tz
+    b = DT / tz
     lam = tl.zeros((BLOCK,), dtype=tl.float32)                   # adjoint of the state after day t (carried backwards)
     gcz = tl.zeros((BLOCK,), dtype=tl.float32)
     gb = tl.zeros((BLOCK,), dtype=tl.float32)
@@ -155,16 +155,17 @@ def _theta_bwd(p_ptr, e_ptr, cz_ptr, tz_ptr, x0_ptr, X_ptr, gX_ptr, gp_ptr, ge_p
         tl.store(gp_ptr + n * T + t, gp, mask=m)
         tl.store(ge_ptr + n * T + t, gev, mask=m)
     tl.store(gcz_ptr + n, gcz, mask=m)
-    tl.store(gtz_ptr + n, -gb / (tz * tz), mask=m)
+    tl.store(gtz_ptr + n, -gb * DT / (tz * tz), mask=m)
 
 
 class ThetaStore(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, p, ev, x0, cz, tz):
+    def forward(ctx, p, ev, x0, cz, tz, dt=1.0):
         N, T = p.shape
         a = [v.detach().float().contiguous() for v in (p, ev, cz, tz, x0)]
         X = torch.empty(N, T, device=p.device)
-        _theta_fwd[(triton.cdiv(N, BLOCK),)](*a, X, N, T, BLOCK=BLOCK)
+        _theta_fwd[(triton.cdiv(N, BLOCK),)](*a, X, N, T, float(dt), BLOCK=BLOCK)
+        ctx.dt = float(dt)
         ctx.save_for_backward(*a, X)
         return X
 
@@ -174,11 +175,11 @@ class ThetaStore(torch.autograd.Function):
         N, T = p.shape
         gp, ge = torch.empty_like(p), torch.empty_like(p)
         gcz, gtz = torch.empty_like(cz), torch.empty_like(tz)
-        _theta_bwd[(triton.cdiv(N, BLOCK),)](p, ev, cz, tz, x0, X, gX.contiguous().float(), gp, ge, gcz, gtz, N, T, BLOCK=BLOCK)
-        return gp, ge, None, gcz, gtz
+        _theta_bwd[(triton.cdiv(N, BLOCK),)](p, ev, cz, tz, x0, X, gX.contiguous().float(), gp, ge, gcz, gtz, N, T, ctx.dt, BLOCK=BLOCK)
+        return gp, ge, None, gcz, gtz, None
 
 
-def theta_state(p, ev, cz, tz, x0=None):
-    """p, ev [N, T] precipitation (liquid input) and demand (mm/d); cz, tz [N] -> Z [N, T] after each day (theta = Z / cz)"""
+def theta_state(p, ev, cz, tz, x0=None, dt=1.0):
+    """p, ev [N, T] liquid input and demand (mm per step); cz [N], tz [N] (days), dt (days) -> Z [N, T] after each step"""
     x0 = 0.3 * cz.detach() if x0 is None else x0
-    return ThetaStore.apply(p, ev, x0, cz, tz)
+    return ThetaStore.apply(p, ev, x0, cz, tz, dt)

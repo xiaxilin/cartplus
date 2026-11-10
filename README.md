@@ -100,6 +100,45 @@ With `--noise SIGMA` the standardised attributes of every catchment are perturbe
 the model is run once per draw and the flows are averaged. The paper uses SIGMA 0.1, 0.2, 0.3, 0.5, 0.7 and 1.0 on GB and US and 0.3
 and 0.5 on AUS (`configs/paper_forward.csv`).
 
+## Hourly branch: a time-step invariant scheme
+
+This branch adds a step length to every operator (`ModelConfig.dt`, in days; every parameter keeps its daily unit) and replaces the
+step-start scheme of the published daily models by a uniform-input scheme. The input of a step arrives at a constant rate within
+the step, and every store integrates its own equation over the step:
+
+| operator | solution over a step | order |
+|---|---|---|
+| unit hydrographs | rate-form ordinates (`uh.ordinates_rate`), X4 down to one hour | exact |
+| surface layer (CaRT+) | closed form, piecewise linear (`kernels/exact.top_x`) | exact |
+| groundwater store (CaRT) | Riccati solution (`exact.quad_x`) | exact |
+| groundwater store with uptake (CaRT+) | one symmetric sub-step (`exact.gwet_x`) | 2 |
+| quick store | 4 symmetric sub-steps with Richardson extrapolation (`exact.quick_x`, `exact.lin_x`) | 4 |
+| production store | wetting and drying exact in the net input, then percolation | 1 in the percolation |
+| near-stream zone, hillslope wetness | Riccati and Bernoulli solutions | exact |
+
+The order of each store follows its relaxation rate at the daily step: high for the quick store, first order for percolation and
+depression storage, whose rates are about 0.01 to 0.02 per day. The new kernels have hand-written adjoints (`kernels/exact_bwd.py`).
+A daily and an hourly run of the same network then agree, so a network trained on daily flows runs at an hourly step as trained.
+The networks of the main branch belong to the step-start scheme; train new ones on this branch with `cart.train` as above
+(daily data, `dt = 1`).
+
+To run a trained network hourly, build a `cart.data.Dataset` whose forcing and discharge are amounts per hour (mm/h) on an hourly
+`days` list (each step carries its date). Its `train` and `val` periods set the training-mean recharge of the groundwater store and
+the end of the default simulation. Then pass `dt = 1/24` to the configuration:
+
+```python
+import torch
+from cart.config import config_for
+from cart.model import CaRT
+cfg = config_for("cartplus", "gb", dt=1 / 24)
+model = CaRT(ds_hourly, cfg, "cuda:0"); model.net.load_state_dict(torch.load("runs/gb_cartplus_s0/net.pt"))
+Q = model.simulate(TT=model.T)[0]                   # [catchments, hours], mm/h
+```
+
+`tests/check_exact.py` checks the new kernels and their adjoints at `dt = 1` and `1/24`. `tests/check_dt.py` checks the unit
+hydrographs, the hourly water balance and the agreement of an hourly and a daily run on evenly spread forcing. The first run
+compiles the Triton kernels, the backward of the quick store of CaRT+ in about 13 minutes; Triton caches them afterwards.
+
 ## Citation
 
 Xia, X. (2026). From hydrological laws to catchment models: A process-based model matches deep-learning accuracy on three
